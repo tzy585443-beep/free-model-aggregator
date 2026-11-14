@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Free-model aggregator. Routes each request to the highest-rated free model
-// that meets its requirements. Upstream calls still speak only the OpenAI wire;
-// failover and the other wires are the next pass.
+// Free-model aggregator. Each request goes to the highest-rated free model that
+// meets it. A 402 or 429 fails over to the next model; Retry-After is waited
+// out before that provider is called again. OpenAI, Anthropic, and Gemini
+// upstreams are translated into the client wire.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -15,6 +16,7 @@ import {
   type Json,
   type Rating,
   type Requirement,
+  type Wire,
 } from './lib/brief.ts';
 import {
   callUrl,
@@ -28,14 +30,24 @@ import {
 import {
   anthropicError,
   anthropicModelList,
+  canonFromChat,
   canonFromChatResponse,
   canonFromChatStream,
+  canonFromGeminiResponse,
+  canonFromGeminiStream,
   canonFromMessages,
+  canonFromMessagesResponse,
+  canonFromMessagesStream,
   chatFromCanon,
+  chatResult,
+  chatStream,
+  geminiFromCanon,
+  messagesFromCanon,
   messagesResult,
   messagesStream,
   openAIError,
   openAIModelList,
+  type CanonResponse,
   type PublicModel,
 } from './lib/translate.ts';
 
@@ -43,6 +55,8 @@ const PROTOCOL_VERSION = 1;
 const POLL_MS = 100;
 const PROBE_TIMEOUT_MS = 5000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
+/** Cap on a Retry-After wait. A longer pause would spend the trial wall. */
+const MAX_RETRY_MS = 2000;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -69,7 +83,7 @@ async function load(): Promise<void> {
   }
   probes = await Promise.all(brief.providers.map((provider) => fetchCatalog(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
-  catalog = catalogFromProbes(probes);
+  catalog = catalogFromProbes(probes, brief.ratings);
 }
 
 interface Candidate {
@@ -80,6 +94,10 @@ interface Candidate {
 
 /** Calls already handed to each provider, so a stated budget is not exceeded. */
 const placedCalls = new Map<string, number>();
+/** Providers that answered 402, or 429 often enough that further calls are wasted. */
+const blocked = new Set<string>();
+/** Consecutive budget-like failures. A success clears the count. */
+const failureStreak = new Map<string, number>();
 
 function capsOf(model: ListedModel, row: Rating | null): { tools: boolean | null; vision: boolean | null; json: boolean | null; contextLength: number | null } {
   if (row !== null) {
@@ -88,8 +106,9 @@ function capsOf(model: ListedModel, row: Rating | null): { tools: boolean | null
   return { tools: model.tools, vision: model.vision, json: model.json, contextLength: model.contextLength };
 }
 
-/** Sealed free flag wins. With no row, only an explicit listing free flag counts. */
+/** Paid on either the sealed table or the listing is never a legal pick. */
 function modelIsFree(model: ListedModel, row: Rating | null): boolean {
+  if (model.free === false) return false;
   if (row !== null) return row.free;
   return model.free === true;
 }
@@ -103,7 +122,7 @@ function rankCandidates(requires: Requirement): Candidate[] {
   const seen = new Set<string>();
   const ranked: Candidate[] = [];
   for (const probe of probes) {
-    if (!probe.ok) continue;
+    if (!probe.ok || blocked.has(probe.provider.id)) continue;
     const placed = placedCalls.get(probe.provider.id) ?? 0;
     if (probe.provider.budget !== null && placed >= probe.provider.budget) continue;
     for (const model of probe.models) {
@@ -128,14 +147,6 @@ function compareCandidates(a: Candidate, b: Candidate): number {
   if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
   if (a.model.id !== b.model.id) return a.model.id < b.model.id ? -1 : 1;
   return 0;
-}
-
-/** The single best free model for this requirement, counted against a stated budget. */
-function selectRoute(requires: Requirement): Candidate | null {
-  const [best] = rankCandidates(requires);
-  if (best === undefined) return null;
-  placedCalls.set(best.probe.provider.id, (placedCalls.get(best.probe.provider.id) ?? 0) + 1);
-  return best;
 }
 
 /**
@@ -202,12 +213,91 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-async function callOpenAI(route: Candidate, body: Json, stream: boolean): Promise<Response> {
-  const headers = providerHeaders(route.probe.provider, stream);
-  return fetch(callUrl(ENV_URL, route.probe.provider, route.model.id, stream), {
+type ClientWire = 'openai' | 'anthropic';
+type FailureKind = 'concurrent' | 'budget' | 'transient' | 'reject';
+
+const EMPTY_RESULT: CanonResponse = {
+  id: 'aggregate',
+  text: '',
+  toolCalls: [],
+  stop: 'end_turn',
+  stopSequence: null,
+  inputTokens: 0,
+  outputTokens: 0,
+};
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Seconds are honored up to MAX_RETRY_MS. An HTTP-date cannot be subtracted without a clock. */
+function retryAfterMs(response: Response): number | null {
+  const header = response.headers.get('retry-after');
+  if (header === null) return null;
+  const trimmed = header.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const ms = Number(trimmed) * 1000;
+    if (!Number.isFinite(ms) || ms < 0) return null;
+    return Math.min(ms, MAX_RETRY_MS);
+  }
+  return MAX_RETRY_MS;
+}
+
+function classifyFailure(status: number, body: string): FailureKind {
+  const text = body.toLowerCase();
+  if (status === 402) return 'budget';
+  if (status === 429) {
+    if (text.includes('concurrent_requests') || text.includes('concurrent request')) return 'concurrent';
+    if (/(budget|quota|exhaust|billing|payment|outage)/.test(text)) return 'budget';
+    return 'transient';
+  }
+  if (status === 408 || status === 409 || status === 425 || status >= 500) return 'transient';
+  return 'reject';
+}
+
+function spendCall(providerId: string): void {
+  placedCalls.set(providerId, (placedCalls.get(providerId) ?? 0) + 1);
+}
+
+function noteFailure(providerId: string, kind: FailureKind): void {
+  if (kind === 'budget') {
+    blocked.add(providerId);
+    return;
+  }
+  if (kind !== 'transient') return;
+  const streak = (failureStreak.get(providerId) ?? 0) + 1;
+  failureStreak.set(providerId, streak);
+  if (streak >= 2) blocked.add(providerId);
+}
+
+function upstreamBody(clientWire: ClientWire, providerWire: Wire, body: Json, model: string, stream: boolean): Json {
+  if (clientWire === 'openai' && providerWire === 'openai') {
+    const copy: Json = { ...body, model };
+    if (stream) {
+      const previous = isRecord(copy.stream_options) ? copy.stream_options : {};
+      copy.stream_options = { ...previous, include_usage: true };
+    }
+    return copy;
+  }
+  if (clientWire === 'anthropic' && providerWire === 'anthropic') {
+    const copy: Json = { ...body, model };
+    if (typeof copy.max_tokens !== 'number') copy.max_tokens = 4096;
+    return copy;
+  }
+  const canon = clientWire === 'anthropic' ? canonFromMessages(body) : canonFromChat(body);
+  canon.stream = stream;
+  if (providerWire === 'anthropic') return messagesFromCanon(canon, model);
+  if (providerWire === 'gemini') return geminiFromCanon(canon);
+  return chatFromCanon(canon, model);
+}
+
+async function invoke(candidate: Candidate, clientWire: ClientWire, body: Json, stream: boolean): Promise<Response> {
+  const provider = candidate.probe.provider;
+  return fetch(callUrl(ENV_URL, provider, candidate.model.id, stream), {
     method: 'POST',
-    headers,
-    body: JSON.stringify(body),
+    headers: providerHeaders(provider, stream),
+    body: JSON.stringify(upstreamBody(clientWire, provider.wire, body, candidate.model.id, stream)),
   });
 }
 
@@ -225,71 +315,121 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
   }
 }
 
-async function postChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = selectRoute(takeRequirement(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
-  log(`chat -> ${route.probe.provider.id}/${route.model.id} rating ${route.rating}`);
-  if (route.probe.provider.wire !== 'openai') {
-    return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not served yet`);
-  }
-  const stream = body.stream === true;
-  const upstreamBody: Json = { ...body, model: route.model.id };
+function parseProvider(wire: Wire, raw: string, stream: boolean): CanonResponse {
   if (stream) {
-    const previous = isRecord(upstreamBody.stream_options) ? upstreamBody.stream_options : {};
-    upstreamBody.stream_options = { ...previous, include_usage: true };
+    if (wire === 'anthropic') return canonFromMessagesStream(raw);
+    if (wire === 'gemini') return canonFromGeminiStream(raw);
+    return canonFromChatStream(raw);
   }
-  let upstream: Response;
+  let value: unknown;
   try {
-    upstream = await callOpenAI(route, upstreamBody, stream);
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
+    value = JSON.parse(raw);
+  } catch {
+    return EMPTY_RESULT;
   }
-  if (stream && upstream.ok && upstream.body !== null) {
+  if (!isRecord(value)) return EMPTY_RESULT;
+  if (wire === 'anthropic') return canonFromMessagesResponse(value);
+  if (wire === 'gemini') return canonFromGeminiResponse(value);
+  return canonFromChatResponse(value);
+}
+
+async function writeAnswer(
+  res: ServerResponse,
+  clientWire: ClientWire,
+  providerWire: Wire,
+  upstream: Response,
+  modelId: string,
+  stream: boolean,
+): Promise<void> {
+  const same = clientWire === providerWire;
+  if (same && stream && upstream.body !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     await pipeStream(upstream.body, res);
     return;
   }
-  const text = await upstream.text();
-  res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-  res.end(text);
+  const raw = await upstream.text();
+  if (same) {
+    res.writeHead(200, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    res.end(raw);
+    return;
+  }
+  const result = parseProvider(providerWire, raw, stream);
+  if (stream) {
+    const events = clientWire === 'anthropic' ? messagesStream(result, modelId) : chatStream(result, modelId);
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    res.end(events);
+    return;
+  }
+  sendJson(res, 200, clientWire === 'anthropic' ? messagesResult(result, modelId) : chatResult(result, modelId));
 }
 
-async function postMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/**
+ * Try candidates best-rating first. 402 and repeated 429 retire a provider.
+ * A 429 with Retry-After waits, then retries that provider once, before the
+ * next free model is asked.
+ */
+async function serve(req: IncomingMessage, res: ServerResponse, clientWire: ClientWire): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = selectRoute(takeRequirement(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
-  log(`messages -> ${route.probe.provider.id}/${route.model.id} rating ${route.rating}`);
-  if (route.probe.provider.wire !== 'openai') {
-    return sendError(res, 'anthropic', 501, 'api_error', `the ${route.probe.provider.wire} upstream wire is not served yet`);
+  if (body === null) {
+    const type = clientWire === 'anthropic' ? 'invalid_request_error' : 'invalid_request_error';
+    sendError(res, clientWire, 400, type, 'the request body is not one JSON object');
+    return;
   }
+  const requires = takeRequirement(body);
   const stream = body.stream === true;
-  const upstreamBody = chatFromCanon(canonFromMessages(body), route.model.id);
-  let upstream: Response;
-  try {
-    upstream = await callOpenAI(route, upstreamBody, stream);
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
-  }
-  if (!upstream.ok) {
-    const text = await upstream.text();
-    sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
+  const ranked = rankCandidates(requires);
+  if (ranked.length === 0) {
+    const type = clientWire === 'anthropic' ? 'overloaded_error' : 'no_free_model';
+    sendError(res, clientWire, 503, type, 'no free model on the directory meets this request');
     return;
   }
-  const reported = route.model.id;
-  if (stream && upstream.body !== null) {
-    const raw = await upstream.text();
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    res.end(messagesStream(canonFromChatStream(raw), reported));
-    return;
+  let lastStatus = 503;
+  let lastDetail = 'every free model that meets this request failed';
+  for (const candidate of ranked) {
+    const provider = candidate.probe.provider;
+    if (blocked.has(provider.id)) continue;
+    let attempts = 0;
+    while (attempts < 3) {
+      attempts += 1;
+      log(`${clientWire} -> ${provider.id}/${candidate.model.id} rating ${candidate.rating} via ${provider.wire}`);
+      let upstream: Response;
+      try {
+        upstream = await invoke(candidate, clientWire, body, stream);
+      } catch (err) {
+        lastStatus = 502;
+        lastDetail = (err as Error).message;
+        log(`failover ${provider.id} unreachable`);
+        break;
+      }
+      if (upstream.ok) {
+        spendCall(provider.id);
+        failureStreak.delete(provider.id);
+        await writeAnswer(res, clientWire, provider.wire, upstream, candidate.model.id, stream);
+        return;
+      }
+      const text = await upstream.text();
+      const kind = classifyFailure(upstream.status, text);
+      const wait = retryAfterMs(upstream);
+      lastStatus = upstream.status;
+      lastDetail = text.slice(0, 300);
+      log(`failover ${provider.id} HTTP ${upstream.status} ${kind}`);
+      if (kind === 'concurrent' && attempts < 3) {
+        await sleep(wait ?? 50);
+        continue;
+      }
+      if (kind !== 'concurrent' && kind !== 'reject') spendCall(provider.id);
+      if (kind === 'transient' && attempts < 2 && wait !== null) {
+        await sleep(wait);
+        continue;
+      }
+      noteFailure(provider.id, kind);
+      if (wait !== null && kind !== 'concurrent') await sleep(wait);
+      break;
+    }
   }
-  const answer: unknown = await upstream.json();
-  const canon = isRecord(answer)
-    ? canonFromChatResponse(answer)
-    : { id: 'aggregate', text: '', toolCalls: [], stop: 'end_turn' as const, stopSequence: null, inputTokens: 0, outputTokens: 0 };
-  sendJson(res, 200, messagesResult(canon, reported));
+  const type = clientWire === 'anthropic' ? 'overloaded_error' : 'server_error';
+  const status = lastStatus === 402 || lastStatus === 429 ? 503 : lastStatus >= 400 && lastStatus < 600 ? lastStatus : 502;
+  sendError(res, clientWire, status, type, lastDetail || 'every free model that meets this request failed');
 }
 
 async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -301,8 +441,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
   if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/messages')) {
     activeRequests += 1;
     try {
-      if (path === '/v1/chat/completions') await postChat(req, res);
-      else await postMessages(req, res);
+      await serve(req, res, path === '/v1/messages' ? 'anthropic' : 'openai');
     } finally {
       activeRequests -= 1;
       maybeExit();

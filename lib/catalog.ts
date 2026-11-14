@@ -7,11 +7,13 @@
 
 import {
   authHeaders,
+  findRating,
   isRecord,
   joinBase,
   stripModelPrefix,
   type Json,
   type ProviderEntry,
+  type RatingTable,
   type Wire,
 } from './brief.ts';
 
@@ -73,33 +75,65 @@ export function callUrl(envUrl: string, provider: ProviderEntry, modelId: string
   return `${root}/v1/chat/completions`;
 }
 
-/** GET the provider's model list in its own wire. Failures stay out of the catalog. */
+/** GET the provider's model list in its own wire, following a short page chain. */
 export async function fetchCatalog(envUrl: string, provider: ProviderEntry, timeoutMs: number): Promise<Probe> {
   if (envUrl === '') {
     return { provider, ok: false, status: 0, models: [], error: 'MAKEFUN_ENV_URL is not set' };
   }
   const root = joinBase(envUrl, provider.base);
   const url = provider.wire === 'gemini' ? `${root}/v1beta/models` : `${root}/v1/models`;
+  const models: ListedModel[] = [];
+  const seenPages = new Set<string>();
+  let token: string | null = null;
+  let status = 0;
   try {
-    const response = await fetch(url, {
-      headers: providerHeaders(provider, false),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) {
-      return { provider, ok: false, status: response.status, models: [], error: `GET ${url} answered HTTP ${response.status}` };
+    for (let page = 0; page < 8; page += 1) {
+      const pageUrl = token === null ? url : pageUrlFor(url, provider.wire, token);
+      const response = await fetch(pageUrl, {
+        headers: providerHeaders(provider, false),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      status = response.status;
+      if (!response.ok) {
+        if (page === 0) return { provider, ok: false, status, models: [], error: `GET ${url} answered HTTP ${response.status}` };
+        break;
+      }
+      const body: unknown = await response.json();
+      models.push(...modelsFromListing(provider.wire, body));
+      const next = nextPage(provider.wire, body);
+      if (next === null || seenPages.has(next)) break;
+      seenPages.add(next);
+      token = next;
     }
-    const body: unknown = await response.json();
-    return { provider, ok: true, status: response.status, models: modelsFromListing(provider.wire, body), error: null };
+    return { provider, ok: true, status, models, error: null };
   } catch (err) {
+    if (models.length > 0) return { provider, ok: true, status, models, error: null };
     return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
   }
 }
 
+function pageUrlFor(url: string, wire: Wire, token: string): string {
+  const joiner = url.includes('?') ? '&' : '?';
+  if (wire === 'gemini') return `${url}${joiner}pageToken=${encodeURIComponent(token)}`;
+  if (wire === 'anthropic') return `${url}${joiner}after_id=${encodeURIComponent(token)}&limit=100`;
+  return `${url}${joiner}after=${encodeURIComponent(token)}`;
+}
+
+function nextPage(wire: Wire, body: unknown): string | null {
+  if (!isRecord(body)) return null;
+  if (wire === 'gemini') {
+    return typeof body.nextPageToken === 'string' && body.nextPageToken !== '' ? body.nextPageToken : null;
+  }
+  if (body.has_more !== true) return null;
+  return typeof body.last_id === 'string' && body.last_id !== '' ? body.last_id : null;
+}
+
 /**
- * Catalog built from listings alone. A listing that hides its price leaves
- * `free` false until a later pass fills the gap from the sealed quality table.
+ * One catalog row per listed model. An explicit listing free flag is the
+ * provider's word. When the listing hides the price, the sealed quality table
+ * fills `free` and `context_length`.
  */
-export function catalogFromProbes(probes: readonly Probe[]): CatalogDocument {
+export function catalogFromProbes(probes: readonly Probe[], ratings: RatingTable | null): CatalogDocument {
   const providers: CatalogProvider[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
@@ -109,10 +143,11 @@ export function catalogFromProbes(probes: readonly Probe[]): CatalogDocument {
     for (const model of ordered) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
+      const row = findRating(ratings, probe.provider.id, model.id);
       models.push({
         id: model.id,
-        free: model.free === true,
-        context_length: model.contextLength,
+        free: model.free !== null ? model.free : row?.free === true,
+        context_length: model.contextLength ?? row?.contextLength ?? null,
       });
     }
     providers.push({

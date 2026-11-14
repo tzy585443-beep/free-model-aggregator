@@ -472,17 +472,30 @@ export function canonFromMessagesStream(raw: string): CanonResponse {
 
 export function canonFromGeminiStream(raw: string): CanonResponse {
   const trimmed = raw.trim();
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+  if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && !trimmed.startsWith('data:')) {
     const value = parseJson(trimmed);
     if (Array.isArray(value)) return mergeGemini(value, 'gemini');
     if (isRecord(value)) return canonFromGeminiResponse(value);
   }
   const chunks: unknown[] = [];
-  for (const frame of framesOf(raw)) {
-    const payload = frame.data.trim();
-    if (payload === '') continue;
+  const payloads: string[] = [];
+  for (const frame of framesOf(raw)) if (frame.data.trim() !== '') payloads.push(frame.data);
+  if (payloads.length === 0) {
+    for (const line of raw.replace(/\r\n/g, '\n').split('\n')) {
+      const text = line.trim();
+      if (text.startsWith('data:')) payloads.push(text.slice('data:'.length).trim());
+    }
+  }
+  for (const payload of payloads) {
     const value = parseJson(payload);
-    if (value !== null) chunks.push(value);
+    if (value !== null) {
+      chunks.push(value);
+      continue;
+    }
+    for (const line of payload.split('\n')) {
+      const nested = parseJson(line);
+      if (nested !== null) chunks.push(nested);
+    }
   }
   return mergeGemini(chunks, 'gemini');
 }
