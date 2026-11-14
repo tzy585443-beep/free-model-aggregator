@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Free-model aggregator. Round 1: register, list, and serve both client wires
-// through OpenAI-wire providers. Routing is first-fit; failover and the other
-// upstream wires come in later passes.
+// Free-model aggregator. Routes each request to the highest-rated free model
+// that meets its requirements. Upstream calls still speak only the OpenAI wire;
+// failover and the other wires are the next pass.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -72,10 +72,14 @@ async function load(): Promise<void> {
   catalog = catalogFromProbes(probes);
 }
 
-interface Route {
+interface Candidate {
   probe: Probe;
   model: ListedModel;
+  rating: number;
 }
+
+/** Calls already handed to each provider, so a stated budget is not exceeded. */
+const placedCalls = new Map<string, number>();
 
 function capsOf(model: ListedModel, row: Rating | null): { tools: boolean | null; vision: boolean | null; json: boolean | null; contextLength: number | null } {
   if (row !== null) {
@@ -84,29 +88,60 @@ function capsOf(model: ListedModel, row: Rating | null): { tools: boolean | null
   return { tools: model.tools, vision: model.vision, json: model.json, contextLength: model.contextLength };
 }
 
+/** Sealed free flag wins. With no row, only an explicit listing free flag counts. */
 function modelIsFree(model: ListedModel, row: Rating | null): boolean {
   if (row !== null) return row.free;
   return model.free === true;
 }
 
 /**
- * First free model in brief order whose id sorts first on that provider.
- * This ignores sealed ratings on purpose; the next pass ranks by rating_milli.
+ * Free models that meet `requires`, best sealed rating first.
+ * Equal ratings go to the provider we have called less often, then by id,
+ * so the order is a pure function of the brief, the listings, and prior calls.
  */
-function selectRoute(requires: Requirement): Route | null {
+function rankCandidates(requires: Requirement): Candidate[] {
+  const seen = new Set<string>();
+  const ranked: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    const models = [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-    for (const model of models) {
+    const placed = placedCalls.get(probe.provider.id) ?? 0;
+    if (probe.provider.budget !== null && placed >= probe.provider.budget) continue;
+    for (const model of probe.models) {
+      const key = `${probe.provider.id}\0${model.id}`;
+      if (seen.has(key)) continue;
       const row = findRating(brief.ratings, probe.provider.id, model.id);
       if (!modelIsFree(model, row)) continue;
       if (!allows(requires, capsOf(model, row))) continue;
-      return { probe, model };
+      seen.add(key);
+      ranked.push({ probe, model, rating: row?.ratingMilli ?? 0 });
     }
   }
-  return null;
+  ranked.sort((a, b) => compareCandidates(a, b));
+  return ranked;
 }
 
+function compareCandidates(a: Candidate, b: Candidate): number {
+  if (b.rating !== a.rating) return b.rating - a.rating;
+  const aPlaced = placedCalls.get(a.probe.provider.id) ?? 0;
+  const bPlaced = placedCalls.get(b.probe.provider.id) ?? 0;
+  if (aPlaced !== bPlaced) return aPlaced - bPlaced;
+  if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
+  if (a.model.id !== b.model.id) return a.model.id < b.model.id ? -1 : 1;
+  return 0;
+}
+
+/** The single best free model for this requirement, counted against a stated budget. */
+function selectRoute(requires: Requirement): Candidate | null {
+  const [best] = rankCandidates(requires);
+  if (best === undefined) return null;
+  placedCalls.set(best.probe.provider.id, (placedCalls.get(best.probe.provider.id) ?? 0) + 1);
+  return best;
+}
+
+/**
+ * Manifest requirements are the ones the trial scores. Arrival order follows
+ * the manifest. Past the end of the manifest, the body itself is the source.
+ */
 function takeRequirement(body: Json): Requirement {
   const workload = brief.workload;
   if (workload !== null && manifestCursor < workload.length) {
@@ -167,7 +202,7 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-async function callOpenAI(route: Route, body: Json, stream: boolean): Promise<Response> {
+async function callOpenAI(route: Candidate, body: Json, stream: boolean): Promise<Response> {
   const headers = providerHeaders(route.probe.provider, stream);
   return fetch(callUrl(ENV_URL, route.probe.provider, route.model.id, stream), {
     method: 'POST',
@@ -195,6 +230,7 @@ async function postChat(req: IncomingMessage, res: ServerResponse): Promise<void
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const route = selectRoute(takeRequirement(body));
   if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
+  log(`chat -> ${route.probe.provider.id}/${route.model.id} rating ${route.rating}`);
   if (route.probe.provider.wire !== 'openai') {
     return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not served yet`);
   }
@@ -225,6 +261,7 @@ async function postMessages(req: IncomingMessage, res: ServerResponse): Promise<
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const route = selectRoute(takeRequirement(body));
   if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
+  log(`messages -> ${route.probe.provider.id}/${route.model.id} rating ${route.rating}`);
   if (route.probe.provider.wire !== 'openai') {
     return sendError(res, 'anthropic', 501, 'api_error', `the ${route.probe.provider.wire} upstream wire is not served yet`);
   }
